@@ -1,0 +1,5 @@
+1. From the root of this repository, run:
+   ```
+   mkdir -p data
+   python imagenet_convert.py --raw_data_dir=$IMAGENET_PATH/normal --local_scratch_dir="./data"
+   ```

@@ -1,5 +1,3 @@
-# Taken from https://github.com/tensorflow/tpu/blob/c75705856290a4119d609110956442449d73e0a5/tools/datasets/imagenet_to_gcs.py
-#
 # Copyright 2017 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,10 +33,9 @@ To run the script to preprocess the raw dataset as TFRecords and upload to gcs,
 run the following command:
 
 ```
-python3 imagenet_to_gcs.py \
-  --project="TEST_PROJECT" \
-  --gcs_output_path="gs://TEST_BUCKET/IMAGENET_DIR" \
-  --raw_data_dir="path/to/imagenet"
+python3 imagenet_convert.py \
+  --raw_data_dir="path/to/imagenet" \
+  --local_scratch_dir="./data"
 ```
 
 """
@@ -46,19 +43,11 @@ python3 imagenet_to_gcs.py \
 import math
 import os
 import random
-from typing import Iterable, List, Mapping, Union, Tuple
-from absl import app
-from absl import flags
-from absl import logging
+from typing import Mapping
 
 import tensorflow.compat.v1 as tf
+from absl import app, flags, logging
 
-from google.cloud import storage
-
-flags.DEFINE_string(
-    "project", None, "Google cloud project id for uploading the dataset."
-)
-flags.DEFINE_string("gcs_output_path", None, "GCS path for uploading the dataset.")
 flags.DEFINE_string(
     "local_scratch_dir", None, "Scratch directory path for temporary files."
 )
@@ -68,17 +57,11 @@ flags.DEFINE_string(
     "Directory path for raw Imagenet dataset. "
     "Should have train and validation subdirectories inside it.",
 )
-flags.DEFINE_boolean("gcs_upload", True, "Set to false to not upload to gcs.")
 
 FLAGS = flags.FLAGS
 
-LABELS_FILE = "synset_labels.txt"
-
-TRAINING_SHARDS = 1024
 VALIDATION_SHARDS = 128
-
-TRAINING_DIRECTORY = "train"
-VALIDATION_DIRECTORY = "validation"
+VALIDATION_DIRECTORY = "val"
 
 
 def _check_or_create_dir(directory: str):
@@ -87,14 +70,14 @@ def _check_or_create_dir(directory: str):
         tf.gfile.MakeDirs(directory)
 
 
-def _int64_feature(value: Union[int, Iterable[int]]) -> tf.train.Feature:
+def _int64_feature(value: int | list[int]) -> tf.train.Feature:
     """Inserts int64 features into Example proto."""
     if not isinstance(value, list):
         value = [value]
     return tf.train.Feature(int64_list=tf.train.Int64List(value=value))
 
 
-def _bytes_feature(value: Union[bytes, str]) -> tf.train.Feature:
+def _bytes_feature(value: bytes | str) -> tf.train.Feature:
     """Inserts bytes features into Example proto."""
     if isinstance(value, str):
         value = bytes(value, "utf-8")
@@ -236,7 +219,7 @@ class ImageCoder(object):
         return image
 
 
-def _process_image(filename: str, coder: ImageCoder) -> Tuple[str, int, int]:
+def _process_image(filename: str, coder: ImageCoder) -> tuple[str, int, int]:
     """Processes a single image file.
 
     Args:
@@ -278,8 +261,8 @@ def _process_image(filename: str, coder: ImageCoder) -> Tuple[str, int, int]:
 def _process_image_files_batch(
     coder: ImageCoder,
     output_file: str,
-    filenames: Iterable[str],
-    synsets: Iterable[Union[str, bytes]],
+    filenames: list[str],
+    synsets: list[str],
     labels: Mapping[str, int],
 ):
     """Processes and saves a list of images as TFRecords.
@@ -306,13 +289,13 @@ def _process_image_files_batch(
 
 
 def _process_dataset(
-    filenames: Iterable[str],
-    synsets: Iterable[str],
+    filenames: list[str],
+    synsets: list[str],
     labels: Mapping[str, int],
     output_directory: str,
     prefix: str,
     num_shards: int,
-) -> List[str]:
+) -> list[str]:
     """Processes and saves list of images as TFRecords.
 
     Args:
@@ -347,9 +330,7 @@ def _process_dataset(
     return files
 
 
-def convert_to_tf_records(
-    raw_data_dir: str, local_scratch_dir: str
-) -> Tuple[List[str], List[str]]:
+def convert_to_tf_records(raw_data_dir: str, local_scratch_dir: str):
     """Converts the Imagenet dataset into TF-Record dumps."""
 
     # Shuffle training records to ensure we are distributing classes
@@ -361,156 +342,36 @@ def convert_to_tf_records(
         random.shuffle(order)
         return order
 
-    # Glob all the training files
-    training_files = tf.gfile.Glob(
-        os.path.join(raw_data_dir, TRAINING_DIRECTORY, "*", "*.JPEG")
+    # Glob all the validation files
+    files = tf.gfile.Glob(
+        os.path.join(raw_data_dir, VALIDATION_DIRECTORY, "*", "*.JPEG")
     )
 
     # Get training file synset labels from the directory name
-    training_synsets = [os.path.basename(os.path.dirname(f)) for f in training_files]
-    training_synsets = list(map(lambda x: bytes(x, "utf-8"), training_synsets))
+    synsets = [str(os.path.basename(os.path.dirname(f))) for f in files]
 
-    training_shuffle_idx = make_shuffle_idx(len(training_files))
-    training_files = [training_files[i] for i in training_shuffle_idx]
-    training_synsets = [training_synsets[i] for i in training_shuffle_idx]
-
-    # Glob all the validation files
-    validation_files = sorted(
-        tf.gfile.Glob(os.path.join(raw_data_dir, VALIDATION_DIRECTORY, "*.JPEG"))
-    )
-
-    # Get validation file synset labels from labels.txt
-    validation_synsets = (
-        tf.gfile.FastGFile(os.path.join(raw_data_dir, LABELS_FILE), "rb")
-        .read()
-        .splitlines()
-    )
+    shuffle_idx = make_shuffle_idx(len(files))
+    files = [files[i] for i in shuffle_idx]
+    synsets = [synsets[i] for i in shuffle_idx]
 
     # Create unique ids for all synsets
-    labels = {
-        v: k + 1
-        for k, v in enumerate(sorted(set(validation_synsets + training_synsets)))
-    }
+    labels = {v: k + 1 for k, v in enumerate(sorted(set(synsets)))}
 
     # Create training data
-    logging.info("Processing the training data.")
-    training_records = _process_dataset(
-        training_files,
-        training_synsets,
-        labels,
-        os.path.join(local_scratch_dir, TRAINING_DIRECTORY),
-        TRAINING_DIRECTORY,
-        TRAINING_SHARDS,
-    )
-
-    # Create validation data
     logging.info("Processing the validation data.")
-    validation_records = _process_dataset(
-        validation_files,
-        validation_synsets,
+    _process_dataset(
+        files,
+        synsets,
         labels,
         os.path.join(local_scratch_dir, VALIDATION_DIRECTORY),
         VALIDATION_DIRECTORY,
         VALIDATION_SHARDS,
     )
 
-    return training_records, validation_records
-
-
-def upload_to_gcs(
-    training_records: Iterable[str],
-    validation_records: Iterable[str],
-    gcs_output_path: str,
-    gcs_project: str,
-    client: storage.Client = None,
-):
-    """Uploads TF-Record files to GCS, at provided path."""
-
-    # Find the GCS bucket_name and key_prefix for dataset files
-    path_parts = gcs_output_path[5:].split("/", 1)
-    bucket_name = path_parts[0]
-    if len(path_parts) == 1:
-        key_prefix = ""
-    elif path_parts[1].endswith("/"):
-        key_prefix = path_parts[1]
-    else:
-        key_prefix = path_parts[1] + "/"
-
-    client = client if client else storage.Client(project=gcs_project)
-    bucket = client.get_bucket(bucket_name)
-
-    def _upload_files(filenames: Iterable[str]):
-        """Uploads a list of files into a specifc subdirectory."""
-        for i, filename in enumerate(sorted(filenames)):
-            blob = bucket.blob(key_prefix + os.path.basename(filename))
-            blob.upload_from_filename(filename)
-            if not i % 20:
-                logging.info("Finished uploading file: %s", filename)
-
-    # Upload training dataset
-    logging.info("Uploading the training data.")
-    _upload_files(training_records)
-
-    # Upload validation dataset
-    logging.info("Uploading the validation data.")
-    _upload_files(validation_records)
-
-
-def run(
-    raw_data_dir: str,
-    gcs_upload: bool,
-    gcs_project: str,
-    gcs_output_path: str,
-    local_scratch_dir: str,
-    client: storage.Client = None,
-):
-    """Runs the ImageNet preprocessing and uploading to GCS.
-
-    Args:
-      raw_data_dir: str, the path to the folder with raw ImageNet data.
-      gcs_upload: bool, whether or not to upload to GCS.
-      gcs_project: str, the GCS project to upload to.
-      gcs_output_path: str, the GCS bucket to write to.
-      local_scratch_dir: str, the local directory path.
-      client: An optional storage client.
-
-    """
-    if gcs_upload and gcs_project is None:
-        raise ValueError("GCS Project must be provided.")
-
-    if gcs_upload and gcs_output_path is None:
-        raise ValueError("GCS output path must be provided.")
-    elif gcs_upload and not gcs_output_path.startswith("gs://"):
-        raise ValueError("GCS output path must start with gs://")
-
-    if raw_data_dir is None:
-        raise AssertionError(
-            "The ImageNet download path is no longer supported. Please download "
-            "and extract the .tar files manually and provide the `raw_data_dir`."
-        )
-
-    # Convert the raw data into tf-records
-    training_records, validation_records = convert_to_tf_records(
-        raw_data_dir=raw_data_dir, local_scratch_dir=local_scratch_dir
-    )
-
-    # Upload to GCS
-    if gcs_upload:
-        upload_to_gcs(
-            training_records=training_records,
-            validation_records=validation_records,
-            gcs_output_path=gcs_output_path,
-            gcs_project=gcs_project,
-            client=client,
-        )
-
 
 def main(_):
-    run(
+    convert_to_tf_records(
         raw_data_dir=FLAGS.raw_data_dir,
-        gcs_upload=FLAGS.gcs_upload,
-        gcs_project=FLAGS.project,
-        gcs_output_path=FLAGS.gcs_output_path,
         local_scratch_dir=FLAGS.local_scratch_dir,
     )
 
